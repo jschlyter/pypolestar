@@ -101,57 +101,39 @@ class PolestarAuth:
             and self.token_expiry > datetime.now(tz=timezone.utc)
         )
 
-    async def get_token(self, refresh: bool = False) -> None:
+    async def get_token(self, refresh: bool = True, force: bool = False) -> None:
         """Get the token from Polestar."""
 
+        response = None
+
         if (
-            not refresh
-            or self.token_expiry is None
-            or self.token_expiry < datetime.now(tz=timezone.utc)
+            not force
+            and self.access_token is not None
+            and self.token_expiry
+            and self.token_expiry < datetime.now(tz=timezone.utc)
         ):
-            if (code := await self._get_code()) is None:
-                return
-
-            token_request = {
-                "grant_type": "authorization_code",
-                "client_id": OIDC_CLIENT_ID,
-                "code": code,
-                "redirect_uri": OIDC_REDIRECT_URI,
-                **(
-                    {
-                        "code_verifier": self.oidc_code_verifier,
-                    }
-                    if self.oidc_code_verifier
-                    else {}
-                ),
-            }
-
-        elif self.refresh_token:
-            token_request = {
-                "grant_type": "refresh_token",
-                "client_id": OIDC_CLIENT_ID,
-                "refresh_token": self.refresh_token,
-            }
-        else:
+            self.logger.debug("Token still valid until %s", self.token_expiry)
             return
 
-        self.logger.debug(
-            "Call token endpoint with grant_type=%s", token_request["grant_type"]
-        )
+        if refresh and self.refresh_token:
+            try:
+                response = await self._token_refresh()
+                self.logger.debug("Token refreshed")
+            except PolestarAuthException:
+                self.logger.debug("Unable to refresh token")
+                self.latest_call_code = None
 
-        try:
-            result = await self.client_session.post(
-                self.oidc_configuration["token_endpoint"],
-                data=token_request,
-                timeout=HTTPX_TIMEOUT,
-            )
-        except Exception as exc:
-            self.latest_call_code = None
-            self.logger.error("Auth Token Error: %s", str(exc))
-            raise PolestarAuthException("Error getting token") from exc
+        if not response:
+            try:
+                response = await self._authorization_code()
+                self.logger.debug("Initial token acquired")
+            except PolestarAuthException as exc:
+                self.logger.error("Unable to acquire initial token")
+                self.latest_call_code = None
+                raise exc
 
-        payload = result.json()
-        self.latest_call_code = result.status_code
+        payload = response.json()
+        self.latest_call_code = response.status_code
 
         try:
             self.access_token = payload["access_token"]
@@ -165,6 +147,60 @@ class PolestarAuth:
             raise PolestarAuthException("Incomplete token response") from exc
 
         self.logger.debug("Access token updated, valid until %s", self.token_expiry)
+
+    async def _authorization_code(self) -> httpx.Response:
+        """Get initial token via authorization code."""
+
+        if (code := await self._get_code()) is None:
+            self.logger.warning("Unable to get code")
+            return
+
+        token_request = {
+            "grant_type": "authorization_code",
+            "client_id": OIDC_CLIENT_ID,
+            "code": code,
+            "redirect_uri": OIDC_REDIRECT_URI,
+            **(
+                {"code_verifier": self.oidc_code_verifier}
+                if self.oidc_code_verifier
+                else {}
+            ),
+        }
+
+        self.logger.debug(
+            "Call token endpoint with grant_type=%s", token_request["grant_type"]
+        )
+
+        try:
+            return await self.client_session.post(
+                self.oidc_configuration["token_endpoint"],
+                data=token_request,
+                timeout=HTTPX_TIMEOUT,
+            )
+        except Exception as exc:
+            raise PolestarAuthException("Failed to get initial token") from exc
+
+    async def _token_refresh(self) -> httpx.Response:
+        """Refresh existing token."""
+
+        token_request = {
+            "grant_type": "refresh_token",
+            "client_id": OIDC_CLIENT_ID,
+            "refresh_token": self.refresh_token,
+        }
+
+        self.logger.debug(
+            "Call token endpoint with grant_type=%s", token_request["grant_type"]
+        )
+
+        try:
+            return await self.client_session.post(
+                self.oidc_configuration["token_endpoint"],
+                data=token_request,
+                timeout=HTTPX_TIMEOUT,
+            )
+        except Exception as exc:
+            raise PolestarAuthException("Failed to refresh token") from exc
 
     async def _get_code(self) -> str | None:
         query_params = await self._get_resume_path()
